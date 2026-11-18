@@ -1,11 +1,17 @@
-//! Forward pass Qwen2 (dense) murni Rust: RMSNorm, RoPE, GQA attention, SwiGLU.
-//! Bobot di-dekuantisasi sekali saat load, lalu disimpan sebagai f32.
+//! Forward pass Qwen2 / Llama (dense) murni Rust.
+//! Dua mode bobot:
+//!  - default: semua tensor di-dekuantisasi ke f32 saat load (cepat, RAM ~4x file)
+//!  - low_mem: bobot tetap terkuantisasi (RAM ~ukuran file), dekuantisasi per kolom saat matmul
 
 use crate::gguf::Gguf;
+use crate::quant::{self, block_layout};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub arch: String,
     pub n_layers: usize,
     pub n_heads: usize,
     pub n_kv_heads: usize,
@@ -26,6 +32,7 @@ fn meta_any_f32(g: &Gguf, keys: &[&str]) -> Option<f32> {
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self, String> {
+        let arch = g.architecture().to_string();
         let n_layers = meta_any_u64(g, &["qwen2.block_count", "llama.block_count"])
             .ok_or("metadata block_count tidak ada")? as usize;
         let n_embd = meta_any_u64(g, &["qwen2.embedding_length", "llama.embedding_length"])
@@ -60,16 +67,96 @@ impl Config {
             g.meta_string_array("tokenizer.ggml.tokens").map(|v| v.len())
                 .ok_or("ukuran vocabulary tidak diketahui")?
         };
-        Ok(Self { n_layers, n_heads, n_kv_heads, n_embd, n_ff, n_vocab: vocab, ctx_len, freq_base, rms_eps })
+        Ok(Self { arch, n_layers, n_heads, n_kv_heads, n_embd, n_ff, n_vocab: vocab, ctx_len, freq_base, rms_eps })
     }
 
     pub fn head_dim(&self) -> usize { self.n_embd / self.n_heads }
 }
 
-pub struct Model {
-    pub cfg: Config,
-    w: HashMap<String, Vec<f32>>,
+// ---------------------------------------------------------------------------
+// Penyimpanan bobot
+// ---------------------------------------------------------------------------
+
+pub struct QTensor {
+    dtype: u32,
+    data: Arc<Vec<u8>>,
+    start: usize,
+    end: usize,
+    numel: usize,
 }
+
+impl QTensor {
+    fn dequant_all(&self) -> Result<Vec<f32>, String> {
+        let mut out = vec![0.0f32; self.numel];
+        quant::dequantize(self.dtype, &self.data[self.start..self.end], self.numel, &mut out)?;
+        Ok(out)
+    }
+
+    fn matmul(&self, x: &[f32], n_in: usize, n_out: usize) -> Result<Vec<f32>, String> {
+        let (bk_elems, bk_bytes) = block_layout(self.dtype)
+            .ok_or_else(|| format!("tipe {} belum didukung", self.dtype))?;
+        if n_in % bk_elems != 0 {
+            return Err(format!("dimensi input {n_in} bukan kelipatan blok {bk_elems}"));
+        }
+        let col_bytes = n_in / bk_elems * bk_bytes;
+        if self.end - self.start < n_out * col_bytes {
+            return Err("data bobot tidak cukup untuk matmul".into());
+        }
+        let mut y = vec![0.0f32; n_out];
+        let mut buf = vec![0.0f32; n_in];
+        for o in 0..n_out {
+            let s = self.start + o * col_bytes;
+            quant::dequantize(self.dtype, &self.data[s..s + col_bytes], n_in, &mut buf)?;
+            let mut acc = 0.0f32;
+            for k in 0..n_in { acc += buf[k] * x[k]; }
+            y[o] = acc;
+        }
+        Ok(y)
+    }
+}
+
+pub enum Weight {
+    F32(Vec<f32>),
+    Q(QTensor),
+}
+
+impl Weight {
+    fn as_f32(&self) -> Result<Cow<'_, [f32]>, String> {
+        match self {
+            Weight::F32(v) => Ok(Cow::Borrowed(v)),
+            Weight::Q(q) => Ok(Cow::Owned(q.dequant_all()?)),
+        }
+    }
+
+    fn row(&self, idx: usize, len: usize) -> Result<Vec<f32>, String> {
+        match self {
+            Weight::F32(v) => {
+                let s = idx.checked_mul(len).ok_or("row overflow")?;
+                Ok(v.get(s..s + len).ok_or("row di luar bobot")?.to_vec())
+            }
+            Weight::Q(q) => {
+                let (bk_elems, bk_bytes) = block_layout(q.dtype)
+                    .ok_or_else(|| format!("tipe {} belum didukung", q.dtype))?;
+                let row_bytes = len / bk_elems * bk_bytes;
+                let s = q.start + idx * row_bytes;
+                let mut out = vec![0.0f32; len];
+                quant::dequantize(q.dtype, &q.data[s..s + row_bytes], len, &mut out)?;
+                Ok(out)
+            }
+        }
+    }
+
+    fn matmul(&self, x: &[f32], n_in: usize, n_out: usize) -> Result<Vec<f32>, String> {
+        match self {
+            Weight::F32(v) => Ok(matmul(v, x, n_in, n_out)),
+            Weight::Q(q) => q.matmul(x, n_in, n_out),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operasi matematika
+// ---------------------------------------------------------------------------
 
 fn matmul(w: &[f32], x: &[f32], n_in: usize, n_out: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), n_in * n_out);
@@ -126,21 +213,42 @@ impl KvCache {
     }
 }
 
+pub struct Model {
+    pub cfg: Config,
+    w: HashMap<String, Weight>,
+    pub low_mem: bool,
+}
+
 impl Model {
-    pub fn from_gguf(g: &Gguf) -> Result<Self, String> {
+    pub fn from_gguf(g: &Gguf) -> Result<Self, String> { Self::from_gguf_opts(g, false) }
+
+    pub fn from_gguf_opts(g: &Gguf, low_mem: bool) -> Result<Self, String> {
         let cfg = Config::from_gguf(g)?;
         let mut w = HashMap::new();
         for t in &g.tensors {
-            w.insert(t.name.clone(), g.tensor_f32(t)?);
+            let weight = if low_mem {
+                let (data, start, end) = g.tensor_raw(t)?;
+                Weight::Q(QTensor {
+                    dtype: t.dtype, data, start, end,
+                    numel: t.numel() as usize,
+                })
+            } else {
+                Weight::F32(g.tensor_f32(t)?)
+            };
+            w.insert(t.name.clone(), weight);
         }
-        Ok(Self { cfg, w })
+        Ok(Self { cfg, w, low_mem })
     }
 
-    fn tensor(&self, names: &[&str]) -> Result<&[f32], String> {
+    fn weight(&self, names: &[&str]) -> Result<&Weight, String> {
         for n in names {
             if let Some(v) = self.w.get(*n) { return Ok(v); }
         }
         Err(format!("tensor tidak ditemukan: {}", names.join(" / ")))
+    }
+
+    fn vec(&self, names: &[&str]) -> Result<Cow<'_, [f32]>, String> {
+        self.weight(names)?.as_f32()
     }
 
     /// Jalankan satu token, kembalikan logits vocabulary.
@@ -150,35 +258,33 @@ impl Model {
         let hd = c.head_dim();
         let eps = c.rms_eps;
 
-        let emb = self.tensor(&["token_embd.weight", "tok_embeddings.weight"])?;
-        let mut x = emb[token * c.n_embd..(token + 1) * c.n_embd].to_vec();
+        let emb = self.weight(&["token_embd.weight", "tok_embeddings.weight"])?;
+        let mut x = emb.row(token, c.n_embd)?;
 
         for l in 0..c.n_layers {
             // ---- Attention ----
-            let norm1 = self.tensor(&[
+            let norm1 = self.vec(&[
                 &format!("blk.{l}.attn_norm.weight"),
                 &format!("blk.{l}.ln1.weight"),
             ])?;
-            let xn = rms_norm(&x, norm1, eps);
+            let xn = rms_norm(&x, &norm1, eps);
 
-            let qw = self.tensor(&[&format!("blk.{l}.attn_q.weight"), &format!("blk.{l}.attn_q.w")])?;
-            let kw = self.tensor(&[&format!("blk.{l}.attn_k.weight"), &format!("blk.{l}.attn_k.w")])?;
-            let vw = self.tensor(&[&format!("blk.{l}.attn_v.weight"), &format!("blk.{l}.attn_v.w")])?;
-            let mut q = matmul(qw, &xn, c.n_embd, c.n_embd);
-            let mut k = matmul(kw, &xn, c.n_embd, c.n_kv_heads * hd);
-            let v = matmul(vw, &xn, c.n_embd, c.n_kv_heads * hd);
+            let qw = self.weight(&[&format!("blk.{l}.attn_q.weight")])?;
+            let kw = self.weight(&[&format!("blk.{l}.attn_k.weight")])?;
+            let vw = self.weight(&[&format!("blk.{l}.attn_v.weight")])?;
+            let mut q = qw.matmul(&xn, c.n_embd, c.n_embd)?;
+            let mut k = kw.matmul(&xn, c.n_embd, c.n_kv_heads * hd)?;
+            let v = vw.matmul(&xn, c.n_embd, c.n_kv_heads * hd)?;
 
             for h in 0..c.n_heads { rope(&mut q[h * hd..(h + 1) * hd], hd, pos, c.freq_base); }
             for h in 0..c.n_kv_heads { rope(&mut k[h * hd..(h + 1) * hd], hd, pos, c.freq_base); }
 
-            // Tulis K/V ke cache.
             for h in 0..c.n_kv_heads {
                 let dst = (pos * c.n_kv_heads + h) * hd;
                 cache.k[l][dst..dst + hd].copy_from_slice(&k[h * hd..(h + 1) * hd]);
                 cache.v[l][dst..dst + hd].copy_from_slice(&v[h * hd..(h + 1) * hd]);
             }
 
-            // Attention per head (GQA: beberapa q-head berbagi satu kv-head).
             let mut attn_out = vec![0.0f32; c.n_embd];
             let scale = 1.0 / (hd as f32).sqrt();
             let groups = c.n_heads / c.n_kv_heads;
@@ -202,37 +308,38 @@ impl Model {
                 }
             }
 
-            let ow = self.tensor(&[&format!("blk.{l}.attn_output.weight")])?;
-            let da = matmul(ow, &attn_out, c.n_embd, c.n_embd);
+            let ow = self.weight(&[&format!("blk.{l}.attn_output.weight")])?;
+            let da = ow.matmul(&attn_out, c.n_embd, c.n_embd)?;
             for i in 0..c.n_embd { x[i] += da[i]; }
 
             // ---- Feed forward (SwiGLU) ----
-            let norm2 = self.tensor(&[&format!("blk.{l}.ffn_norm.weight")])?;
-            let xn2 = rms_norm(&x, norm2, eps);
-            let gw = self.tensor(&[&format!("blk.{l}.ffn_gate.weight")])?;
-            let uw = self.tensor(&[&format!("blk.{l}.ffn_up.weight")])?;
-            let dw = self.tensor(&[&format!("blk.{l}.ffn_down.weight")])?;
-            let gate = matmul(gw, &xn2, c.n_embd, c.n_ff);
-            let up = matmul(uw, &xn2, c.n_embd, c.n_ff);
+            let norm2 = self.vec(&[&format!("blk.{l}.ffn_norm.weight")])?;
+            let xn2 = rms_norm(&x, &norm2, eps);
+            let gw = self.weight(&[&format!("blk.{l}.ffn_gate.weight")])?;
+            let uw = self.weight(&[&format!("blk.{l}.ffn_up.weight")])?;
+            let dw = self.weight(&[&format!("blk.{l}.ffn_down.weight")])?;
+            let gate = gw.matmul(&xn2, c.n_embd, c.n_ff)?;
+            let up = uw.matmul(&xn2, c.n_embd, c.n_ff)?;
             let mut act = vec![0.0f32; c.n_ff];
             for i in 0..c.n_ff {
                 let g = gate[i];
                 act[i] = (g / (1.0 + (-g).exp())) * up[i];
             }
-            let dff = matmul(dw, &act, c.n_ff, c.n_embd);
+            let dff = dw.matmul(&act, c.n_ff, c.n_embd)?;
             for i in 0..c.n_embd { x[i] += dff[i]; }
         }
 
-        let final_norm = self.tensor(&["output_norm.weight", "model.norm.weight"])?;
-        x = rms_norm(&x, final_norm, eps);
-        let out_w = self.tensor(&["output.weight", "lm_head.weight"])?;
-        Ok(matmul(out_w, &x, c.n_embd, c.n_vocab))
+        let final_norm = self.vec(&["output_norm.weight", "model.norm.weight"])?;
+        x = rms_norm(&x, &final_norm, eps);
+        let out_w = self.weight(&["output.weight", "lm_head.weight"])?;
+        out_w.matmul(&x, c.n_embd, c.n_vocab)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gguf::tiny_fixture;
 
     #[test]
     fn softmax_sums_to_one() {
@@ -252,8 +359,24 @@ mod tests {
 
     #[test]
     fn matmul_shape() {
-        let w: Vec<f32> = (0..6).map(|x| x as f32).collect(); // [2 input, 3 output]
+        let w: Vec<f32> = (0..6).map(|x| x as f32).collect();
         let y = matmul(&w, &[1.0, 2.0], 2, 3);
         assert_eq!(y, vec![2.0, 8.0, 14.0]);
+    }
+
+    #[test]
+    fn low_mem_matches_f32_logits() {
+        let bytes = tiny_fixture();
+        let g = Gguf::parse(bytes).unwrap();
+        let fast = Model::from_gguf(&g).unwrap();
+        let lean = Model::from_gguf_opts(&g, true).unwrap();
+        let mut c1 = KvCache::new(&fast.cfg);
+        let mut c2 = KvCache::new(&lean.cfg);
+        let a = fast.forward(1, 0, &mut c1).unwrap();
+        let b = lean.forward(1, 0, &mut c2).unwrap();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-4, "fast={x}, low_mem={y}");
+        }
     }
 }

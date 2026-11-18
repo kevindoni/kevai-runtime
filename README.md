@@ -32,11 +32,15 @@ kevai-runtime inspect model.gguf --tensors
 kevai-runtime tiny tiny.gguf
 kevai-runtime chat tiny.gguf --max-tokens 32
 
-# Chat dengan model asli
+# Chat dengan model asli (cepat, butuh RAM ±4x ukuran file)
 kevai-runtime chat kevai-edge-Q4_K_M.gguf --max-tokens 256 --temp 0.8
+
+# Mode hemat memori: bobot tetap terkuantisasi (RAM ≈ ukuran file, lebih lambat)
+kevai-runtime chat kevai-edge-Q4_K_M.gguf --low-mem --max-tokens 256
 
 # Server OpenAI-compatible
 kevai-runtime serve kevai-edge-Q4_K_M.gguf --addr 127.0.0.1:8080 --name kevai
+kevai-runtime serve kevai-edge-Q4_K_M.gguf --addr 127.0.0.1:8080 --low-mem
 ```
 
 Endpoint server:
@@ -87,10 +91,13 @@ Sekarang panel AI memakai model KevAI lokal — tidak ada Ollama, tidak ada API 
 
 ## Batasan saat ini
 
-- Arsitektur **Qwen2 dense** saja (belum Qwen2-MoE, Llama, Gemma).
-- Bobot di-dekuantisasi ke `f32` saat load → butuh RAM ±4× ukuran file GGUF
-  (model 1.5B Q4_K ≈ 1 GB file → ±6 GB RAM). Ini trade-off untuk kesederhanaan;
-  langkah berikutnya: simpan bobot quantized dan dekuantisasi per baris saat matmul.
+- Arsitektur **Qwen2 dense dan Llama dense** (belum MoE / Gemma).
+- Dua mode memori:
+  - **default** — bobot di-dekuantisasi ke `f32` saat load: paling cepat, RAM ±4× ukuran file
+    (1.5B Q4_K ≈ 1 GB file → ±6 GB RAM).
+  - **`--low-mem`** — bobot tetap terkuantisasi, dekuantisasi per kolom saat matmul:
+    RAM ≈ ukuran file GGUF, tapi inferensi lebih lambat. Cocok untuk laptop RAM 8 GB.
+  - Keduanya sudah diuji menghasilkan logits identik (tes `low_mem_matches_f32_logits`).
 - Inferensi CPU single-thread per permintaan (belum SIMD/rayon/GPU).
 - `tokenizer.chat_template` (Jinja) belum dieksekusi; template ChatML mengikuti format
   pelatihan `train_lora_local.py`.
@@ -101,6 +108,7 @@ Sekarang panel AI memakai model KevAI lokal — tidak ada Ollama, tidak ada API 
 - [x] Tokenizer + forward Qwen2 + sampling + chat CLI
 - [x] Server OpenAI-compatible + SSE
 - [ ] Integrasi ke panel AI AiKoding IDE (pengaturan endpoint)
-- [ ] Bobot quantized di memory + matmul SIMD
-- [ ] Workflow GitHub Actions: training -> merge -> GGUF artifact
-- [ ] Dukungan architecture lain (Llama, Qwen2-MoE)
+- [x] Bobot quantized di memory (`--low-mem`)
+- [x] Workflow GitHub Actions: training -> merge -> GGUF artifact
+- [x] Dukungan arsitektur Llama dense
+- [ ] matmul SIMD / dukungan Qwen2-MoE

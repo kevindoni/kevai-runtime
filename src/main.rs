@@ -106,17 +106,19 @@ fn arg_value(args: &[String], key: &str) -> Option<String> {
     args.iter().position(|a| a == key).and_then(|i| args.get(i + 1)).cloned()
 }
 
-fn chat(path: &Path, system: &str, max_tokens: usize, temp: f32) -> Result<(), String> {
+fn chat(path: &Path, system: &str, max_tokens: usize, temp: f32, low_mem: bool) -> Result<(), String> {
     println!("[1/3] Membaca GGUF: {}", path.display());
     let g = Gguf::from_file(path)?;
     println!("[2/3] Menyiapkan tokenizer & model...");
     let tok = Tokenizer::from_gguf(&g)?;
-    let model = Model::from_gguf(&g)?;
+    let model = Model::from_gguf_opts(&g, low_mem)?;
     let mut cache = KvCache::new(&model.cfg);
     let mut sampler = Sampler::new(0x4b45564149);
     sampler.temperature = temp;
-    println!("[3/3] Siap — {} layer, {} head, {} vocab, ctx {}.",
-        model.cfg.n_layers, model.cfg.n_heads, model.cfg.n_vocab, model.cfg.ctx_len);
+    println!("[3/3] Siap — {} {}, {} layer, {} head, {} vocab, ctx {}.{}",
+        model.cfg.arch, if model.low_mem { "(low-mem)" } else { "" },
+        model.cfg.n_layers, model.cfg.n_heads, model.cfg.n_vocab, model.cfg.ctx_len,
+        if model.low_mem { " Bobot tetap terkuantisasi di RAM." } else { "" });
     println!("Ketik 'exit' untuk keluar. System: \"{system}\"\n");
 
     let stdin = io::stdin();
@@ -175,8 +177,8 @@ fn help() {
     println!("  kevai-runtime inspect <model.gguf> [--tensors]");
     println!("  kevai-runtime fixture <out.gguf>       # contoh parser (bukan model)");
     println!("  kevai-runtime tiny <out.gguf>          # model Qwen2 mini untuk test pipeline");
-    println!("  kevai-runtime chat <model.gguf> [--system teks] [--max-tokens N] [--temp F]");
-    println!("  kevai-runtime serve <model.gguf> [--addr 127.0.0.1:8080] [--name kevai]");
+    println!("  kevai-runtime chat <model.gguf> [--system teks] [--max-tokens N] [--temp F] [--low-mem]");
+    println!("  kevai-runtime serve <model.gguf> [--addr 127.0.0.1:8080] [--name kevai] [--low-mem]");
     println!("  kevai-runtime --help");
 }
 
@@ -222,7 +224,8 @@ fn main() {
                     .and_then(|v| v.parse().ok()).unwrap_or(256usize);
                 let temp = arg_value(&args, "--temp")
                     .and_then(|v| v.parse().ok()).unwrap_or(0.8f32);
-                chat(Path::new(&args[1]), &system, max_tokens, temp)
+                let low_mem = args.iter().any(|a| a == "--low-mem");
+                chat(Path::new(&args[1]), &system, max_tokens, temp, low_mem)
             }
         }
         "serve" => {
@@ -233,7 +236,8 @@ fn main() {
                 let name = arg_value(&args, "--name").unwrap_or_else(|| "kevai".into());
                 let system = arg_value(&args, "--system")
                     .unwrap_or_else(|| "Anda adalah KevAI, asisten pribadi Kevin. Jawab dalam Bahasa Indonesia yang santai dan jelas.".into());
-                server::serve(Path::new(&args[1]), &addr, system, name)
+                let low_mem = args.iter().any(|a| a == "--low-mem");
+                server::serve(Path::new(&args[1]), &addr, system, name, low_mem)
             }
         }
         other => Err(format!("perintah tidak dikenal: {other}")),

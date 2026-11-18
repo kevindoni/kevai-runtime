@@ -7,6 +7,7 @@
 use crate::quant::{self, tensor_nbytes, type_name};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 const MAGIC: &[u8; 4] = b"GGUF";
 
@@ -95,7 +96,8 @@ pub struct Gguf {
     pub tensors: Vec<TensorInfo>,
     /// Posisi absolut di file tempat data tensor dimulai.
     pub data_offset: usize,
-    bytes: Vec<u8>,
+    /// Dipakai bersama model saat mode hemat memori (tanpa salinan data).
+    bytes: Arc<Vec<u8>>,
 }
 
 struct Reader<'a> {
@@ -226,7 +228,7 @@ impl Gguf {
             }
         }
 
-        Ok(Self { version, metadata, tensors, data_offset, bytes })
+        Ok(Self { version, metadata, tensors, data_offset, bytes: Arc::new(bytes) })
     }
 
     pub fn meta(&self, key: &str) -> Option<&Value> {
@@ -258,6 +260,18 @@ impl Gguf {
         let mut out = vec![0f32; n];
         quant::dequantize(t.dtype, &self.bytes[start..end], n, &mut out)?;
         Ok(out)
+    }
+
+    /// Akses data tensor mentah (tanpa dekuantisasi) + posisi dan panjangnya.
+    /// Buffer dibagi (Arc) dengan Gguf agar tidak ada salinan data di RAM.
+    pub fn tensor_raw(&self, t: &TensorInfo) -> Result<(Arc<Vec<u8>>, usize, usize), String> {
+        let nb = t.nbytes()? as usize;
+        let start = self.data_offset
+            .checked_add(t.offset as usize)
+            .ok_or("offset tensor overflow")?;
+        let end = start.checked_add(nb).ok_or("ukuran tensor overflow")?;
+        if end > self.bytes.len() { return Err("data tensor melewati akhir file".into()); }
+        Ok((Arc::clone(&self.bytes), start, end))
     }
 }
 

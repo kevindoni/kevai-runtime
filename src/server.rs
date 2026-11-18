@@ -19,12 +19,12 @@ pub struct Shared {
     pub name: String,
 }
 
-pub fn serve(model_path: &Path, addr: &str, system: String, name: String) -> Result<(), String> {
+pub fn serve(model_path: &Path, addr: &str, system: String, name: String, low_mem: bool) -> Result<(), String> {
     println!("[1/3] Membaca GGUF: {}", model_path.display());
     let g = Gguf::from_file(model_path)?;
     println!("[2/3] Menyiapkan model & tokenizer...");
     let shared = Arc::new(Shared {
-        model: Model::from_gguf(&g)?,
+        model: Model::from_gguf_opts(&g, low_mem)?,
         tok: Tokenizer::from_gguf(&g)?,
         system,
         name,
