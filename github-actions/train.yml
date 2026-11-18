@@ -1,0 +1,93 @@
+name: kevai-train
+
+# Trigger:
+#  - manual
+#  - push ke master
+#  - tiap 5 jam (job punya timeout 350 menit, jadi ada jeda sebelum run berikutnya)
+# Cache work/ dipakai untuk RESUME dari checkpoint antar run.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: '0 */5 * * *'
+
+concurrency:
+  group: kevai-train
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers peft datasets accelerate
+
+      - name: Restore checkpoint
+        uses: actions/cache@v4
+        with:
+          path: work/
+          key: kevai-work-${{ github.run_id }}
+          restore-keys: |
+            kevai-work-
+
+      - name: TRAINING (auto-resume)
+        run: python train_lora_local.py
+
+      - name: Cek penanda DONE
+        id: done
+        run: |
+          if [ -f work/DONE ]; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+            echo "entri: $(cat work/dataset_count.txt 2>/dev/null || echo '?')"
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- Konversi GGUF hanya saat training tuntas ----
+      # llama.cpp dipakai HANYA sebagai alat build-time di CI.
+      # Runtime (kevai-runtime) tidak bergantung padanya.
+      - name: Konversi ke GGUF (Q4_K_M)
+        if: steps.done.outputs.done == 'true'
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+          python -m pip install --upgrade numpy transformers sentencepiece gguf
+          CONVERT=$(find /tmp/llama.cpp -name convert_hf_to_gguf.py -print -quit)
+          if [ -z "$CONVERT" ]; then
+            echo "convert_hf_to_gguf.py tidak ditemukan" >&2
+            exit 1
+          fi
+          python "$CONVERT" work/merged \
+            --outfile work/kevai-edge-Q4_K_M.gguf \
+            --outtype q4_k_m
+          ls -lh work/*.gguf
+
+      - name: Upload model GGUF
+        if: steps.done.outputs.done == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kevai-edge-gguf
+          path: work/*.gguf
+          retention-days: 90
+
+      - name: Upload log training
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kevai-work-${{ github.run_id }}
+          path: work/
+          retention-days: 14
